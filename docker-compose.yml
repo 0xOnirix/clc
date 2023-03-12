@@ -1,0 +1,159 @@
+version: "3.5"
+
+services:
+  traefik:
+    image: traefik:v2.9.7
+    container_name: "traefik"
+    restart: always
+    command:
+#      - "--log.level=DEBUG"
+      - "--api.dashboard=true"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge=true"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
+      - "--certificatesresolvers.letsencrypt.acme.email=lolilol@gmail.com"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+    ports:
+      - "80:80"
+      - "443:443"
+    labels:
+      - "traefik.enable=true"
+      # Dashboard
+      - "traefik.http.routers.traefik.rule=(Host(`traefik.lan`))"
+      - "traefik.http.routers.traefik.service=api@internal"
+      - "traefik.http.routers.traefik.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.traefik.entrypoints=websecure"
+      - "traefik.http.routers.traefik.middlewares=dashboardauth"
+      - "traefik.http.middlewares.dashboardauth.basicauth.users=admin:$$apr1$$a03ilohx$$dTolcSsxpZWGFXGt8gaus."
+      # HTTPS Redirect
+      - "traefik.http.routers.http-catchall.rule=hostregexp(`{host:.+}`)"
+      - "traefik.http.routers.http-catchall.entrypoints=web"
+      - "traefik.http.routers.http-catchall.middlewares=redirect-to-https@docker"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./letsencrypt:/letsencrypt
+    networks:
+      mastodon_external_network:
+        ipv4_address: 172.26.0.2
+  
+  db:
+    restart: always
+    image: postgres:14-alpine
+    shm_size: 256mb
+    networks:
+      - internal_network
+    healthcheck:
+      test: ['CMD', 'pg_isready', '-U', 'postgres']
+    volumes:
+      - ./postgres14:/var/lib/postgresql/data
+    environment:
+      - 'POSTGRES_HOST_AUTH_METHOD=trust'
+
+  redis:
+    restart: always
+    image: redis:7-alpine
+    networks:
+      - internal_network
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+    volumes:
+      - ./redis:/data
+
+  web:
+    image: tootsuite/mastodon:v4.1.0
+    restart: always
+    env_file: .env.production
+    command: bash -c "rm -f /mastodon/tmp/pids/server.pid; bundle exec rails s -p 3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider --proxy=off localhost:3000/health || exit 1"]
+    expose:
+      - "3000"
+    depends_on:
+      - db
+      - redis
+      - traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=mastodon_external_network"
+      - "traefik.http.services.mastodon-web.loadbalancer.server.port=3000"
+      - "traefik.http.routers.mastodon-web.rule=Host(`mastodon.com`)"
+      - "traefik.http.routers.mastodon-web.entrypoints=websecure"
+      - "traefik.http.routers.mastodon-web.tls.certresolver=letsencrypt"
+    volumes:
+      - mastodon_web_storage:/mastodon/public/system
+    networks:
+      internal_network:
+      mastodon_external_network:
+        ipv4_address: 172.26.0.4
+
+  streaming:
+    image: tootsuite/mastodon:v4.1.0
+    restart: always
+    env_file: .env.production
+    command: node ./streaming
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider --proxy=off localhost:4000/api/v1/streaming/health || exit 1"]
+    expose:
+      - "4000"
+    depends_on:
+      - db
+      - redis
+      - traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=mastodon_external_network"
+      - "traefik.http.services.mastodon-streaming.loadbalancer.server.port=4000"
+      - "traefik.http.routers.mastodon-streaming.rule=(Host(`mastodon.com`) && PathPrefix(`/api/v1/streaming`))"
+      - "traefik.http.routers.mastodon-streaming.entrypoints=websecure"
+      - "traefik.http.routers.mastodon-streaming.tls.certresolver=letsencrypt"
+    networks:
+      - mastodon_external_network
+      - internal_network
+
+  sidekiq:
+    image: tootsuite/mastodon:v4.1.0
+    restart: always
+    env_file: .env.production
+    command: bundle exec sidekiq
+    depends_on:
+      - db
+      - redis
+      - traefik
+    volumes:
+      - mastodon_web_storage:/mastodon/public/system
+    networks:
+      internal_network:
+      mastodon_external_network:
+        ipv4_address: 172.26.0.5
+
+networks:
+  mastodon_external_network:
+    name: mastodon_external_network
+    driver: bridge
+    external: true
+    ipam:
+      config:
+        - subnet: 172.26.0.0/24
+          gateway: 172.26.0.1
+  internal_network:
+    internal: true
+
+volumes:
+  mastodon_web_storage:
+    name: mastodon_web_storage
+
+# !!!!!!!!!!!!! IMPORTANT!!!!!!!!!!!!!!!!!!!!!!!!
+# Commande ci dessous est à faire absolument pour avoir l'upload de fichier
+# sudo chown -R 991:991 $(docker volume inspect mastodon_web_storage |jq -r '.[0].Mountpoint')
+
+
+# Créer un nouveau user
+# mastodon@c35a4e19cb97:~$ tootctl accounts create SuperAdminUser --email="myFakeEmail@mastodon.com" --confirmed --role admin
+# New password: 3250364c8742c71c2ce0b0b9ff0a12b4
+
+
+
